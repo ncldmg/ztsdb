@@ -1,0 +1,20 @@
+.{
+    .name = .tsvdb,
+    .version = "0.0.0",
+    .fingerprint = 0x41ab04553cf2065e,
+    .minimum_zig_version = "0.15.2",
+    .dependencies = .{
+        .cli = .{
+            .url = "git+https://github.com/sam701/zig-cli?ref=zig-0.15#cb44aade25a3c1eddd8b6f990b50c2189442c1e2",
+            .hash = "cli-0.10.0-2eKe_5kEAQBeHqKxUHNTGnETzu81rqKWwT1WPt1jXBt0",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        // For example...
+        //"LICENSE",
+        //"README.md",
+    },
+}
