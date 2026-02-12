@@ -124,13 +124,13 @@ pub const WAL = struct {
         try self.flush();
 
         // Then fsync to disk
-        _ = try self.io_uring.fsync(self.file.handle, 0);
+        _ = try self.io_uring.fsync(0, self.file.handle, 0);
         _ = try self.io_uring.submit();
 
-        var cqe: linux.io_uring_cqe = undefined;
-        _ = try self.io_uring.copy_cqes(@as([*]linux.io_uring_cqe, &cqe)[0..1], 1);
+        var cqes: [1]linux.io_uring_cqe = undefined;
+        _ = try self.io_uring.copy_cqes(&cqes, 1);
 
-        if (cqe.err() != .SUCCESS) {
+        if (cqes[0].err() != .SUCCESS) {
             return error.SyncError;
         }
     }
@@ -153,14 +153,14 @@ pub const WAL = struct {
 
         _ = try self.io_uring.submit();
 
-        var cqe: linux.io_uring_cqe = undefined;
-        _ = try self.io_uring.copy_cqes(@as([*]linux.io_uring_cqe, &cqe)[0..1], 1);
+        var cqes: [1]linux.io_uring_cqe = undefined;
+        _ = try self.io_uring.copy_cqes(&cqes, 1);
 
-        if (cqe.err() != .SUCCESS) {
+        if (cqes[0].err() != .SUCCESS) {
             return error.ReadError;
         }
 
-        return @intCast(cqe.res);
+        return @intCast(cqes[0].res);
     }
 
     // Reset WAL (for testing or when starting new segment)

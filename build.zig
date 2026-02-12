@@ -21,6 +21,10 @@ fn buildExecutable(
     optimize: std.builtin.OptimizeMode,
     mod: *std.Build.Module,
 ) *std.Build.Step.Compile {
+    const cli = b.dependency("cli", .{
+        .target = target,
+        .optimize = optimize,
+    });
     const exe = b.addExecutable(.{
         .name = "tsvdb",
         .root_module = b.createModule(.{
@@ -29,6 +33,7 @@ fn buildExecutable(
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "tsvdb", .module = mod },
+                .{ .name = "cli", .module = cli.module("cli") },
             },
         }),
     });
