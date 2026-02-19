@@ -77,4 +77,25 @@ pub fn build(b: *std.Build) void {
     const lib_test_step = b.step("lib-test", "Build library test binary");
     b.installArtifact(mod_tests);
     lib_test_step.dependOn(&b.addInstallArtifact(mod_tests, .{}).step);
+
+    // Copy web assets to zig-out/web
+    const install_html = b.addInstallFile(b.path("src/web/index.html"), "web/index.html");
+
+    const web_step = b.step("web", "Copy web UI assets");
+    web_step.dependOn(&install_html.step);
+
+    // Benchmark executable
+    const bench_exe = b.addExecutable(.{
+        .name = "benchmark",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/benchmark.zig"),
+            .target = target,
+            .optimize = .ReleaseFast, // Always optimize benchmarks
+        }),
+    });
+    b.installArtifact(bench_exe);
+
+    const bench_run = b.addRunArtifact(bench_exe);
+    const bench_step = b.step("bench", "Run benchmarks");
+    bench_step.dependOn(&bench_run.step);
 }

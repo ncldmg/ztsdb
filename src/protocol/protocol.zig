@@ -2,21 +2,21 @@ const std = @import("std");
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
 
-/// Binary protocol for time series data ingestion
-///
-/// Message format:
-/// ┌────────────────────────────────────────────────────────┐
-/// │ Header (16 bytes)                                      │
-/// │ ┌──────────┬─────────┬──────────┬────────────────────┐ │
-/// │ │ Magic    │ Version │ MsgType  │ Payload Length     │ │
-/// │ │ 4 bytes  │ 1 byte  │ 1 byte   │ 4 bytes            │ │
-/// │ └──────────┴─────────┴──────────┴────────────────────┘ │
-/// │ Reserved (6 bytes)                                     │
-/// ├────────────────────────────────────────────────────────┤
-/// │ Payload (variable)                                     │
-/// └────────────────────────────────────────────────────────┘
-///
-/// All integers are little-endian.
+// Binary protocol for time series data ingestion
+//
+// Message format:
+// ┌────────────────────────────────────────────────────────┐
+// │ Header (16 bytes)                                      │
+// │ ┌──────────┬─────────┬──────────┬────────────────────┐ │
+// │ │ Magic    │ Version │ MsgType  │ Payload Length     │ │
+// │ │ 4 bytes  │ 1 byte  │ 1 byte   │ 4 bytes            │ │
+// │ └──────────┴─────────┴──────────┴────────────────────┘ │
+// │ Reserved (6 bytes)                                     │
+// ├────────────────────────────────────────────────────────┤
+// │ Payload (variable)                                     │
+// └────────────────────────────────────────────────────────┘
+//
+// All integers are little-endian.
 
 pub const MAGIC: [4]u8 = .{ 'Z', 'T', 'S', 'D' };
 pub const VERSION: u8 = 1;
@@ -89,7 +89,7 @@ pub const Header = struct {
     }
 };
 
-/// Data point for wire format (24 bytes, packed)
+// Data point for wire format (24 bytes, packed)
 pub const WireDataPoint = extern struct {
     series_id: u64 align(1),
     timestamp: i64 align(1),
@@ -118,7 +118,7 @@ pub const DataPoint = struct {
     value: f64,
 };
 
-/// Query request payload
+// Query request payload
 pub const QueryRequest = struct {
     series_id: u64,
     start_ts: i64,
@@ -141,7 +141,7 @@ pub const QueryRequest = struct {
     }
 };
 
-/// Series stats response payload
+// Series stats response payload
 pub const StatsResponse = struct {
     count: u64,
     min_value: u64, // f64 as bits
@@ -173,6 +173,32 @@ pub const StatsResponse = struct {
     }
 };
 
+// Global database stats response
+pub const GlobalStatsResponse = struct {
+    series_count: u32,
+    total_points: u64,
+    uptime_seconds: u64,
+    connected_clients: u32,
+
+    pub const SIZE: usize = 24;
+
+    pub fn encode(self: GlobalStatsResponse, buf: *[SIZE]u8) void {
+        std.mem.writeInt(u32, buf[0..4], self.series_count, .little);
+        std.mem.writeInt(u64, buf[4..12], self.total_points, .little);
+        std.mem.writeInt(u64, buf[12..20], self.uptime_seconds, .little);
+        std.mem.writeInt(u32, buf[20..24], self.connected_clients, .little);
+    }
+
+    pub fn decode(buf: *const [SIZE]u8) GlobalStatsResponse {
+        return .{
+            .series_count = std.mem.readInt(u32, buf[0..4], .little),
+            .total_points = std.mem.readInt(u64, buf[4..12], .little),
+            .uptime_seconds = std.mem.readInt(u64, buf[12..20], .little),
+            .connected_clients = std.mem.readInt(u32, buf[20..24], .little),
+        };
+    }
+};
+
 pub const ErrorCode = enum(u32) {
     none = 0,
     invalid_message = 1,
@@ -191,7 +217,7 @@ pub const DecodeError = error{
     BufferTooSmall,
 };
 
-/// Protocol encoder/decoder
+// Protocol encoder/decoder
 pub const Protocol = struct {
     allocator: Allocator,
     read_buf: std.ArrayList(u8),
@@ -210,7 +236,7 @@ pub const Protocol = struct {
         self.write_buf.deinit(self.allocator);
     }
 
-    /// Encode a single insert message
+    // Encode a single insert message
     pub fn encodeInsert(self: *Protocol, dp: DataPoint) ![]const u8 {
         self.write_buf.clearRetainingCapacity();
         try self.write_buf.ensureTotalCapacity(self.allocator, HEADER_SIZE + DATA_POINT_SIZE);
@@ -232,7 +258,7 @@ pub const Protocol = struct {
         return self.write_buf.items;
     }
 
-    /// Encode a batch insert message
+    // Encode a batch insert message
     pub fn encodeInsertBatch(self: *Protocol, points: []const DataPoint) ![]const u8 {
         self.write_buf.clearRetainingCapacity();
         const payload_len: u32 = @intCast(points.len * DATA_POINT_SIZE);
@@ -257,7 +283,7 @@ pub const Protocol = struct {
         return self.write_buf.items;
     }
 
-    /// Encode a query request
+    // Encode a query request
     pub fn encodeQuery(self: *Protocol, series_id: u64, start_ts: i64, end_ts: i64) ![]const u8 {
         self.write_buf.clearRetainingCapacity();
         try self.write_buf.ensureTotalCapacity(self.allocator, HEADER_SIZE + QueryRequest.SIZE);
@@ -285,7 +311,7 @@ pub const Protocol = struct {
         return self.write_buf.items;
     }
 
-    /// Encode a query latest request (payload is just series_id)
+    // Encode a query latest request (payload is just series_id)
     pub fn encodeQueryLatest(self: *Protocol, series_id: u64) ![]const u8 {
         self.write_buf.clearRetainingCapacity();
         try self.write_buf.ensureTotalCapacity(self.allocator, HEADER_SIZE + 8);
@@ -308,7 +334,7 @@ pub const Protocol = struct {
         return self.write_buf.items;
     }
 
-    /// Encode an OK response
+    // Encode an OK response
     pub fn encodeOk(self: *Protocol) ![]const u8 {
         self.write_buf.clearRetainingCapacity();
         try self.write_buf.ensureTotalCapacity(self.allocator, HEADER_SIZE);
@@ -327,7 +353,7 @@ pub const Protocol = struct {
         return self.write_buf.items;
     }
 
-    /// Encode an error response
+    // Encode an error response
     pub fn encodeError(self: *Protocol, code: ErrorCode) ![]const u8 {
         self.write_buf.clearRetainingCapacity();
         try self.write_buf.ensureTotalCapacity(self.allocator, HEADER_SIZE + 4);
@@ -350,7 +376,7 @@ pub const Protocol = struct {
         return self.write_buf.items;
     }
 
-    /// Encode a data response (for query results)
+    // Encode a data response (for query results)
     pub fn encodeDataResponse(self: *Protocol, points: []const DataPoint) ![]const u8 {
         self.write_buf.clearRetainingCapacity();
         const payload_len: u32 = @intCast(points.len * DATA_POINT_SIZE);
@@ -375,7 +401,30 @@ pub const Protocol = struct {
         return self.write_buf.items;
     }
 
-    /// Decode header from buffer
+    // Encode a global stats response
+    pub fn encodeGlobalStatsResponse(self: *Protocol, stats: GlobalStatsResponse) ![]const u8 {
+        self.write_buf.clearRetainingCapacity();
+        try self.write_buf.ensureTotalCapacity(self.allocator, HEADER_SIZE + GlobalStatsResponse.SIZE);
+
+        const header = Header{
+            .magic = MAGIC,
+            .version = VERSION,
+            .msg_type = .stats_response,
+            .payload_len = GlobalStatsResponse.SIZE,
+        };
+
+        var header_buf: [HEADER_SIZE]u8 = undefined;
+        header.encode(&header_buf);
+        try self.write_buf.appendSlice(self.allocator, &header_buf);
+
+        var stats_buf: [GlobalStatsResponse.SIZE]u8 = undefined;
+        stats.encode(&stats_buf);
+        try self.write_buf.appendSlice(self.allocator, &stats_buf);
+
+        return self.write_buf.items;
+    }
+
+    // Decode header from buffer
     pub fn decodeHeader(buf: []const u8) DecodeError!Header {
         if (buf.len < HEADER_SIZE) {
             return error.BufferTooSmall;
@@ -383,7 +432,7 @@ pub const Protocol = struct {
         return Header.decode(buf[0..HEADER_SIZE]);
     }
 
-    /// Decode data points from payload buffer
+    // Decode data points from payload buffer
     pub fn decodeDataPoints(allocator: Allocator, payload: []const u8) ![]DataPoint {
         if (payload.len % DATA_POINT_SIZE != 0) {
             return error.InvalidPayloadSize;

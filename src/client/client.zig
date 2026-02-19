@@ -12,6 +12,7 @@ const Protocol = protocol.Protocol;
 const DataPoint = protocol.DataPoint;
 const QueryRequest = protocol.QueryRequest;
 const StatsResponse = protocol.StatsResponse;
+const GlobalStatsResponse = protocol.GlobalStatsResponse;
 const ErrorCode = protocol.ErrorCode;
 const HEADER_SIZE = protocol.HEADER_SIZE;
 const DATA_POINT_SIZE = protocol.DATA_POINT_SIZE;
@@ -184,6 +185,35 @@ pub const Client = struct {
         try self.sendAndExpectOk(&msg);
     }
 
+    /// Get global database stats
+    pub fn getGlobalStats(self: *Client) !GlobalStatsResponse {
+        var msg: [HEADER_SIZE]u8 = undefined;
+        const header = Header{
+            .magic = MAGIC,
+            .version = VERSION,
+            .msg_type = .query_stats,
+            .payload_len = 0,
+        };
+        header.encode(&msg);
+
+        const sock = self.sock orelse return error.NotConnected;
+        _ = try posix.write(sock, &msg);
+
+        // Read response header
+        var header_buf: [HEADER_SIZE]u8 = undefined;
+        _ = try readExact(sock, &header_buf);
+
+        const resp_header = try Protocol.decodeHeader(&header_buf);
+
+        if (resp_header.msg_type == .stats_response and resp_header.payload_len == GlobalStatsResponse.SIZE) {
+            var stats_buf: [GlobalStatsResponse.SIZE]u8 = undefined;
+            _ = try readExact(sock, &stats_buf);
+            return GlobalStatsResponse.decode(&stats_buf);
+        }
+
+        return error.InvalidResponse;
+    }
+
     fn sendAndExpectOk(self: *Client, msg: []const u8) !void {
         const sock = self.sock orelse return error.NotConnected;
 
@@ -279,4 +309,142 @@ test "Client connect to non-existent server fails" {
 
     const result = client.connect();
     try testing.expectError(error.ConnectionRefused, result);
+}
+
+/// Buffered client that batches inserts automatically for high throughput.
+/// Collects single inserts into a buffer and sends them as batches.
+pub const BufferedClient = struct {
+    client: Client,
+    buffer: std.ArrayList(DataPoint),
+    buffer_capacity: usize,
+    total_buffered: usize,
+    total_flushed: usize,
+
+    pub const DEFAULT_BUFFER_CAPACITY: usize = 1000;
+
+    pub const Config = struct {
+        host: []const u8 = "127.0.0.1",
+        port: u16 = 9876,
+        buffer_capacity: usize = DEFAULT_BUFFER_CAPACITY,
+    };
+
+    pub fn init(allocator: Allocator, config: Config) !BufferedClient {
+        var buffer = std.ArrayList(DataPoint){};
+        try buffer.ensureTotalCapacity(allocator, config.buffer_capacity);
+
+        return BufferedClient{
+            .client = try Client.init(allocator, .{
+                .host = config.host,
+                .port = config.port,
+            }),
+            .buffer = buffer,
+            .buffer_capacity = config.buffer_capacity,
+            .total_buffered = 0,
+            .total_flushed = 0,
+        };
+    }
+
+    pub fn deinit(self: *BufferedClient) void {
+        // Flush any remaining buffered data
+        self.flush() catch {};
+        self.buffer.deinit(self.client.allocator);
+        self.client.deinit();
+    }
+
+    pub fn connect(self: *BufferedClient) !void {
+        try self.client.connect();
+    }
+
+    pub fn disconnect(self: *BufferedClient) void {
+        self.flush() catch {};
+        self.client.disconnect();
+    }
+
+    pub fn isConnected(self: *const BufferedClient) bool {
+        return self.client.isConnected();
+    }
+
+    /// Insert a single data point (buffered)
+    /// Data is sent when buffer reaches capacity or flush() is called
+    pub fn insert(self: *BufferedClient, series_id: u64, timestamp: i64, value: f64) !void {
+        try self.buffer.append(self.client.allocator, .{
+            .series_id = series_id,
+            .timestamp = timestamp,
+            .value = value,
+        });
+        self.total_buffered += 1;
+
+        // Auto-flush when buffer is full
+        if (self.buffer.items.len >= self.buffer_capacity) {
+            try self.flush();
+        }
+    }
+
+    /// Insert multiple data points (buffered)
+    pub fn insertMany(self: *BufferedClient, points: []const DataPoint) !void {
+        for (points) |p| {
+            try self.insert(p.series_id, p.timestamp, p.value);
+        }
+    }
+
+    /// Flush buffered data to server
+    pub fn flush(self: *BufferedClient) !void {
+        if (self.buffer.items.len == 0) return;
+
+        try self.client.insertBatch(self.buffer.items);
+        self.total_flushed += self.buffer.items.len;
+        self.buffer.clearRetainingCapacity();
+    }
+
+    /// Get number of points currently buffered
+    pub fn bufferedCount(self: *const BufferedClient) usize {
+        return self.buffer.items.len;
+    }
+
+    /// Get total points buffered since creation
+    pub fn totalBuffered(self: *const BufferedClient) usize {
+        return self.total_buffered;
+    }
+
+    /// Get total points flushed to server
+    pub fn totalFlushed(self: *const BufferedClient) usize {
+        return self.total_flushed;
+    }
+
+    // Pass-through methods for non-buffered operations
+
+    pub fn query(self: *BufferedClient, series_id: u64, start_ts: i64, end_ts: i64) ![]DataPoint {
+        // Flush before query to ensure data consistency
+        try self.flush();
+        return self.client.query(series_id, start_ts, end_ts);
+    }
+
+    pub fn queryLatest(self: *BufferedClient, series_id: u64) !?DataPoint {
+        try self.flush();
+        return self.client.queryLatest(series_id);
+    }
+
+    pub fn ping(self: *BufferedClient) !void {
+        return self.client.ping();
+    }
+
+    pub fn getGlobalStats(self: *BufferedClient) !GlobalStatsResponse {
+        try self.flush();
+        return self.client.getGlobalStats();
+    }
+};
+
+test "BufferedClient buffering" {
+    // This test requires a running server, so we just test the buffering logic
+    const allocator = testing.allocator;
+
+    var client = try BufferedClient.init(allocator, .{
+        .host = "127.0.0.1",
+        .port = 19880,
+        .buffer_capacity = 100,
+    });
+    defer client.deinit();
+
+    // Can't connect (no server), but buffer should work
+    try testing.expectEqual(@as(usize, 0), client.bufferedCount());
 }

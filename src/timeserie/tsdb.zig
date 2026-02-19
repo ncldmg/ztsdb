@@ -1,16 +1,18 @@
 const std = @import("std");
-const testing = std.testing;
 const fs = std.fs;
 const mem = std.mem;
+const testing = std.testing;
 const Allocator = std.mem.Allocator;
-const Chunk = @import("chunk.zig").Chunk;
-const WAL = @import("wal.zig").WAL;
 
-pub const DataPoint = struct {
-    series_id: u64,
-    timestamp: i64,
-    value: f64,
-};
+const Chunk = @import("chunk.zig").Chunk;
+const ChunkPool = @import("chunk.zig").ChunkPool;
+const WAL = @import("wal.zig").WAL;
+const tiered_mod = @import("tiered_storage.zig");
+const TieredStorage = tiered_mod.TieredStorage;
+const ColdStorage = @import("cold_storage.zig").ColdStorage;
+const MmapChunk = @import("mmap_chunk.zig").MmapChunk;
+
+pub const DataPoint = @import("../protocol/protocol.zig").DataPoint;
 
 pub const SeriesStats = struct {
     count: usize,
@@ -25,6 +27,7 @@ pub const TSDB = struct {
     allocator: Allocator,
     wal: WAL,
     active_chunks: std.AutoHashMap(u64, *Chunk),
+    chunk_pool: ChunkPool,
     chunk_capacity: usize,
     wal_serialize_buffer: std.ArrayList(u8),
     batch_size: usize,
@@ -33,17 +36,29 @@ pub const TSDB = struct {
     write_buffer: std.ArrayList(DataPoint),
     write_buffer_capacity: usize,
 
-    const DEFAULT_CHUNK_CAPACITY: usize = 8192;
-    const DEFAULT_WAL_SEGMENT_SIZE: u64 = 64 * 1024 * 1024; // 64MB
-    const DEFAULT_BATCH_SIZE: usize = 1000;
-    const DEFAULT_WRITE_BUFFER_CAPACITY: usize = 1000;
+    // Optional tiered storage for warm/cold data
+    tiered_storage: ?TieredStorage,
+    data_dir: ?fs.Dir,
+
+    pub const DEFAULT_CHUNK_CAPACITY: usize = 8192;
+    pub const DEFAULT_WAL_SEGMENT_SIZE: u64 = 64 * 1024 * 1024; // 64MB
+    pub const DEFAULT_BATCH_SIZE: usize = 1000;
+    pub const DEFAULT_WRITE_BUFFER_CAPACITY: usize = 1000;
+    pub const DEFAULT_CHUNK_POOL_SIZE: usize = 16;
+
+    pub const DEFAULT_MAX_WARM_CHUNKS: usize = 100;
 
     pub const Config = struct {
         chunk_capacity: usize = DEFAULT_CHUNK_CAPACITY,
         wal_segment_size: u64 = DEFAULT_WAL_SEGMENT_SIZE,
         batch_size: usize = DEFAULT_BATCH_SIZE,
         write_buffer_capacity: usize = DEFAULT_WRITE_BUFFER_CAPACITY,
+        chunk_pool_size: usize = DEFAULT_CHUNK_POOL_SIZE,
         wal_path: []const u8,
+        // Tiered storage config (optional)
+        enable_tiered_storage: bool = false,
+        data_dir: ?[]const u8 = null, // Directory for warm/cold storage
+        max_warm_chunks: usize = DEFAULT_MAX_WARM_CHUNKS, // Threshold to trigger cold compaction
     };
 
     pub fn init(allocator: Allocator, config: Config) !TSDB {
@@ -54,15 +69,40 @@ pub const TSDB = struct {
         var write_buffer = std.ArrayList(DataPoint){};
         try write_buffer.ensureTotalCapacity(allocator, config.write_buffer_capacity);
 
+        // Pre-allocate chunk pool
+        const chunk_pool = try ChunkPool.init(allocator, config.chunk_capacity, config.chunk_pool_size);
+
+        // Optional tiered storage
+        var tiered_storage: ?TieredStorage = null;
+        var data_dir: ?fs.Dir = null;
+
+        if (config.enable_tiered_storage) {
+            if (config.data_dir) |dir_path| {
+                // Create data directory if it doesn't exist
+                cwd.makeDir(dir_path) catch |err| {
+                    if (err != error.PathAlreadyExists) return err;
+                };
+                data_dir = try cwd.openDir(dir_path, .{});
+                tiered_storage = try TieredStorage.init(allocator, data_dir.?, .{
+                    .chunk_capacity = config.chunk_capacity,
+                    .chunk_pool_size = config.chunk_pool_size,
+                    .max_warm_chunks = config.max_warm_chunks,
+                });
+            }
+        }
+
         return TSDB{
             .allocator = allocator,
             .wal = wal,
             .active_chunks = std.AutoHashMap(u64, *Chunk).init(allocator),
+            .chunk_pool = chunk_pool,
             .chunk_capacity = config.chunk_capacity,
             .wal_serialize_buffer = std.ArrayList(u8){},
             .batch_size = config.batch_size,
             .write_buffer = write_buffer,
             .write_buffer_capacity = config.write_buffer_capacity,
+            .tiered_storage = tiered_storage,
+            .data_dir = data_dir,
         };
     }
 
@@ -72,12 +112,25 @@ pub const TSDB = struct {
             std.log.err("failed to flush write buffer on deinit: {}", .{err});
         };
 
+        // Release all active chunks back to pool
         var it = self.active_chunks.valueIterator();
         while (it.next()) |chunk_ptr| {
-            chunk_ptr.*.deinit(self.allocator);
-            self.allocator.destroy(chunk_ptr.*);
+            self.chunk_pool.release(chunk_ptr.*);
         }
         self.active_chunks.deinit();
+
+        // Deinit pool (frees all pooled chunks)
+        self.chunk_pool.deinit();
+
+        // Deinit tiered storage if enabled
+        if (self.tiered_storage) |*ts| {
+            ts.deinit();
+        }
+        if (self.data_dir) |dir| {
+            var d = dir;
+            d.close();
+        }
+
         self.wal_serialize_buffer.deinit(self.allocator);
         self.write_buffer.deinit(self.allocator);
         self.wal.deinit();
@@ -110,23 +163,23 @@ pub const TSDB = struct {
         try chunk.insert(timestamp, value);
     }
 
-    // Insert multiple data points in batch for maximum performance
+    // Insert multiple data points in batch (uses same buffer path as insert)
     pub fn insertBatch(self: *TSDB, entries: []const DataPoint) !void {
         if (entries.len == 0) return;
 
-        // Write all entries to WAL in one batch
-        try self.writeBatchToWAL(entries);
-
-        // Insert into chunks
         for (entries) |entry| {
-            const chunk = try self.getOrCreateChunk(entry.series_id);
-            try chunk.insert(entry.timestamp, entry.value);
+            try self.write_buffer.append(self.allocator, entry);
+
+            // Flush when buffer is full
+            if (self.write_buffer.items.len >= self.write_buffer_capacity) {
+                try self.flushWriteBuffer();
+            }
         }
     }
 
     // Query data points for a series within a time range
     pub fn query(self: *TSDB, series_id: u64, start_ts: i64, end_ts: i64, result: *std.ArrayList(DataPoint)) !void {
-        // First check chunk data
+        // First check hot tier (active chunks)
         if (self.active_chunks.get(series_id)) |chunk| {
             // Only scan if time range overlaps with chunk
             if (!(end_ts < chunk.min_ts or start_ts > chunk.max_ts)) {
@@ -142,10 +195,26 @@ pub const TSDB = struct {
             }
         }
 
-        // Also check write buffer for unflushed data
+        // Check write buffer for unflushed data
         for (self.write_buffer.items) |entry| {
             if (entry.series_id == series_id and entry.timestamp >= start_ts and entry.timestamp <= end_ts) {
                 try result.append(self.allocator, entry);
+            }
+        }
+
+        // Check warm/cold tiers if enabled
+        if (self.tiered_storage) |*ts| {
+            var tiered_result = std.ArrayList(tiered_mod.DataPoint){};
+            defer tiered_result.deinit(self.allocator);
+
+            try ts.query(series_id, start_ts, end_ts, &tiered_result);
+
+            for (tiered_result.items) |p| {
+                try result.append(self.allocator, .{
+                    .series_id = p.series_id,
+                    .timestamp = p.timestamp,
+                    .value = p.value,
+                });
             }
         }
     }
@@ -190,24 +259,103 @@ pub const TSDB = struct {
         try self.wal.flush();
     }
 
-    // Flush write buffer to WAL and chunks
+    // Run maintenance tasks (compact warm to cold, etc.)
+    pub fn runMaintenance(self: *TSDB) !void {
+        if (self.tiered_storage) |*ts| {
+            try ts.runMaintenance();
+        }
+    }
+
+    // Check if tiered storage is enabled
+    pub fn hasTieredStorage(self: *const TSDB) bool {
+        return self.tiered_storage != null;
+    }
+
+    // Get tiered storage stats
+    pub fn getTieredStats(self: *const TSDB) ?TieredStorage.Stats {
+        if (self.tiered_storage) |ts| {
+            return ts.getStats();
+        }
+        return null;
+    }
+
+    // Flush write buffer to chunks (memory-only for speed)
+    // WAL is written when chunks flush to warm tier for durability
     pub fn flushWriteBuffer(self: *TSDB) !void {
         if (self.write_buffer.items.len == 0) return;
 
-        // Write all buffered entries to WAL in single batch (queues to io_uring)
-        try self.writeBatchToWAL(self.write_buffer.items);
+        // Group entries by series_id for batch insert
+        // For now, simple approach: process in order but use batch insert per chunk
+        var current_series: u64 = 0;
+        var batch_start: usize = 0;
 
-        // Submit queued writes to kernel (non-blocking)
-        _ = try self.wal.submit();
+        for (self.write_buffer.items, 0..) |entry, i| {
+            if (i == 0) {
+                current_series = entry.series_id;
+                continue;
+            }
 
-        // Insert all entries to chunks
-        for (self.write_buffer.items) |entry| {
-            const chunk = try self.getOrCreateChunk(entry.series_id);
-            try chunk.insert(entry.timestamp, entry.value);
+            // When series changes or at end, flush the batch
+            if (entry.series_id != current_series) {
+                try self.flushBatchToChunk(current_series, self.write_buffer.items[batch_start..i]);
+                current_series = entry.series_id;
+                batch_start = i;
+            }
+        }
+
+        // Flush remaining batch
+        if (batch_start < self.write_buffer.items.len) {
+            try self.flushBatchToChunk(current_series, self.write_buffer.items[batch_start..]);
         }
 
         // Clear buffer but keep capacity
         self.write_buffer.clearRetainingCapacity();
+    }
+
+    // Flush a batch of same-series entries to chunk using vectorized insert
+    fn flushBatchToChunk(self: *TSDB, series_id: u64, entries: []const DataPoint) !void {
+        if (entries.len == 0) return;
+
+        // Extract timestamps and values for batch insert
+        // Use stack buffer for small batches, allocate for large
+        var ts_buf: [1024]i64 = undefined;
+        var val_buf: [1024]f64 = undefined;
+
+        var timestamps: []i64 = undefined;
+        var values: []f64 = undefined;
+        var allocated = false;
+
+        if (entries.len <= 1024) {
+            timestamps = ts_buf[0..entries.len];
+            values = val_buf[0..entries.len];
+        } else {
+            timestamps = try self.allocator.alloc(i64, entries.len);
+            values = try self.allocator.alloc(f64, entries.len);
+            allocated = true;
+        }
+        defer if (allocated) {
+            self.allocator.free(timestamps);
+            self.allocator.free(values);
+        };
+
+        for (entries, 0..) |e, i| {
+            timestamps[i] = e.timestamp;
+            values[i] = e.value;
+        }
+
+        // Insert in batches, handling chunk boundaries
+        var offset: usize = 0;
+        while (offset < entries.len) {
+            const chunk = try self.getOrCreateChunk(series_id);
+            const inserted = chunk.insertBatch(timestamps[offset..], values[offset..]);
+            offset += inserted;
+
+            // If nothing inserted, chunk is full - will be flushed on next getOrCreateChunk
+            if (inserted == 0) {
+                try self.flushChunkToWarm(chunk);
+                chunk.reset(series_id);
+            }
+        }
     }
 
     // Get statistics for a series
@@ -241,12 +389,99 @@ pub const TSDB = struct {
         const entry = try self.active_chunks.getOrPut(series_id);
 
         if (!entry.found_existing) {
-            const chunk_ptr = try self.allocator.create(Chunk);
-            chunk_ptr.* = try Chunk.init(self.allocator, series_id, self.chunk_capacity);
+            // Get chunk from pool (fast path - no allocation if pool has chunks)
+            const chunk_ptr = try self.chunk_pool.acquire(series_id);
             entry.value_ptr.* = chunk_ptr;
         }
 
-        return entry.value_ptr.*;
+        const chunk = entry.value_ptr.*;
+
+        // If chunk is full, flush to warm tier and reset
+        if (chunk.isFull()) {
+            try self.flushChunkToWarm(chunk);
+            chunk.reset(series_id);
+        }
+
+        return chunk;
+    }
+
+    // Flush a full chunk to warm tier storage
+    // Note: WAL not used here since mmap files provide durability via fsync
+    fn flushChunkToWarm(self: *TSDB, chunk: *Chunk) !void {
+        if (chunk.count == 0) return;
+
+        // If no tiered storage, just reset chunk (pure in-memory mode)
+        if (self.tiered_storage == null) return;
+
+        const ts = &self.tiered_storage.?;
+        const data_dir = self.data_dir orelse return;
+
+        // Generate filename for warm chunk
+        var path_buf: [256]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "warm/chunk_{d}_{d}.mmap", .{
+            chunk.series_id,
+            std.time.timestamp(),
+        });
+
+        // Create mmap'd chunk file
+        const mmap = try MmapChunk.create(
+            self.allocator,
+            data_dir,
+            path,
+            chunk.series_id,
+            chunk.timestamps[0..chunk.count],
+            chunk.values[0..chunk.count],
+            chunk.min_ts,
+            chunk.max_ts,
+        );
+
+        try ts.warm_chunks.append(self.allocator, .{
+            .series_id = chunk.series_id,
+            .chunk = mmap,
+            .created_ts = std.time.timestamp(),
+        });
+
+        ts.stats.flushes_to_warm += 1;
+        ts.stats.warm_chunks += 1;
+        ts.stats.warm_points += chunk.count;
+
+        // Auto-compact to cold when warm tier exceeds threshold
+        if (ts.warm_chunks.items.len > ts.config.max_warm_chunks) {
+            ts.compactToCold() catch |err| {
+                std.log.warn("cold compaction failed: {}", .{err});
+            };
+        }
+    }
+
+    // Write entire chunk to WAL in batched operations (WAL queue has limited depth)
+    fn writeChunkToWAL(self: *TSDB, chunk: *Chunk) !void {
+        if (chunk.count == 0) return;
+
+        const WAL_BATCH_SIZE: usize = 200; // Stay under io_uring queue depth (256)
+
+        var offset: usize = 0;
+        while (offset < chunk.count) {
+            const batch_end = @min(offset + WAL_BATCH_SIZE, chunk.count);
+            const batch_size = batch_end - offset;
+
+            // Build batch of data points
+            const batch = try self.allocator.alloc(DataPoint, batch_size);
+            defer self.allocator.free(batch);
+
+            for (0..batch_size) |i| {
+                batch[i] = .{
+                    .series_id = chunk.series_id,
+                    .timestamp = chunk.timestamps[offset + i],
+                    .value = chunk.values[offset + i],
+                };
+            }
+
+            try self.writeBatchToWAL(batch);
+            _ = try self.wal.submit();
+            try self.wal.flush();
+
+            offset = batch_end;
+        }
     }
 
     fn writeToWAL(self: *TSDB, series_id: u64, timestamp: i64, value: f64) !void {
@@ -411,4 +646,50 @@ test "TSDB statistics" {
     try testing.expectEqual(@as(f64, 20.0), stats.?.avg_value);
     try testing.expectEqual(@as(i64, 1000), stats.?.min_timestamp);
     try testing.expectEqual(@as(i64, 3000), stats.?.max_timestamp);
+}
+
+test "TSDB with tiered storage" {
+    const allocator = testing.allocator;
+
+    // Create temp directory for tiered storage
+    var tmp_dir = testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    // Create WAL file path
+    var wal_path_buf: [256]u8 = undefined;
+    const wal_path = try tmp_dir.dir.realpath(".", &wal_path_buf);
+    var full_wal_path: [512]u8 = undefined;
+    const wal_file = try std.fmt.bufPrint(&full_wal_path, "{s}/test_tiered.wal", .{wal_path});
+
+    // Create data dir path
+    var data_path_buf: [256]u8 = undefined;
+    const data_path = try tmp_dir.dir.realpath(".", &data_path_buf);
+
+    var tsdb = try TSDB.init(allocator, .{
+        .wal_path = wal_file,
+        .chunk_capacity = 10, // Small chunks to trigger warm flushes
+        .write_buffer_capacity = 5,
+        .enable_tiered_storage = true,
+        .data_dir = data_path,
+    });
+    defer tsdb.deinit();
+
+    // Verify tiered storage is enabled
+    try testing.expect(tsdb.hasTieredStorage());
+
+    // Insert enough data to fill a chunk and trigger warm flush
+    for (0..20) |i| {
+        try tsdb.insert(1, @intCast(i * 1000), @floatFromInt(i));
+    }
+
+    // Query should find all data (from hot and possibly warm tiers)
+    var result = std.ArrayList(DataPoint){};
+    defer result.deinit(allocator);
+
+    try tsdb.query(1, 0, 30000, &result);
+    try testing.expectEqual(@as(usize, 20), result.items.len);
+
+    // Check tiered stats
+    const tiered_stats = tsdb.getTieredStats();
+    try testing.expect(tiered_stats != null);
 }

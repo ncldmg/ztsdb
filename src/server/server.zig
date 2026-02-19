@@ -5,13 +5,15 @@ const posix = std.posix;
 const Allocator = std.mem.Allocator;
 
 const protocol = @import("../protocol/protocol.zig");
-const tsdb_mod = @import("../timeserie/tsdb.zig");
+const concurrent_tsdb_mod = @import("../timeserie/concurrent_tsdb.zig");
+const ConcurrentTSDB = concurrent_tsdb_mod.ConcurrentTSDB;
 
 const Header = protocol.Header;
 const MessageType = protocol.MessageType;
 const Protocol = protocol.Protocol;
 const DataPoint = protocol.DataPoint;
 const QueryRequest = protocol.QueryRequest;
+const GlobalStatsResponse = protocol.GlobalStatsResponse;
 const ErrorCode = protocol.ErrorCode;
 const HEADER_SIZE = protocol.HEADER_SIZE;
 const DATA_POINT_SIZE = protocol.DATA_POINT_SIZE;
@@ -20,15 +22,16 @@ pub const Server = struct {
     allocator: Allocator,
     address: net.Address,
     listener: ?posix.socket_t,
-    tsdb: ?*tsdb_mod.TSDB,
+    tsdb: ?*ConcurrentTSDB,
     running: std.atomic.Value(bool),
     active_connections: std.atomic.Value(usize),
     proto: Protocol,
+    start_time: i64,
 
     pub const Config = struct {
         host: []const u8 = "127.0.0.1",
         port: u16 = 9876,
-        tsdb: ?*tsdb_mod.TSDB = null,
+        tsdb: ?*ConcurrentTSDB = null,
     };
 
     pub fn init(allocator: Allocator, config: Config) !Server {
@@ -42,6 +45,7 @@ pub const Server = struct {
             .running = std.atomic.Value(bool).init(false),
             .active_connections = std.atomic.Value(usize).init(0),
             .proto = Protocol.init(allocator),
+            .start_time = std.time.timestamp(),
         };
     }
 
@@ -73,7 +77,7 @@ pub const Server = struct {
         self.listener = sock;
         self.running.store(true, .release);
 
-        std.log.info("server listening on {any}", .{self.address});
+        std.log.info("server listening on port {d}", .{self.address.getPort()});
     }
 
     pub fn stop(self: *Server) void {
@@ -111,7 +115,11 @@ pub const Server = struct {
         }
 
         self.handleConnection(client_sock) catch |err| {
-            if (err != error.EndOfFile) {
+            // Ignore expected disconnection errors
+            if (err != error.EndOfFile and
+                err != error.BrokenPipe and
+                err != error.ConnectionResetByPeer)
+            {
                 std.log.err("connection error: {}", .{err});
             }
         };
@@ -179,7 +187,7 @@ pub const Server = struct {
 
                 if (self.tsdb) |db| {
                     const dp = points[0];
-                    db.insert(dp.series_id, dp.timestamp, dp.value) catch |err| {
+                    db.insertOrError(dp.series_id, dp.timestamp, dp.value) catch |err| {
                         std.log.err("insert error: {}", .{err});
                         return self.proto.encodeError(.internal_error);
                     };
@@ -195,8 +203,8 @@ pub const Server = struct {
                 defer self.allocator.free(points);
 
                 if (self.tsdb) |db| {
-                    // Convert to TSDB DataPoint format
-                    const tsdb_points = try self.allocator.alloc(tsdb_mod.DataPoint, points.len);
+                    // Convert to ConcurrentTSDB DataPoint format
+                    const tsdb_points = try self.allocator.alloc(concurrent_tsdb_mod.DataPoint, points.len);
                     defer self.allocator.free(tsdb_points);
 
                     for (points, 0..) |p, i| {
@@ -222,7 +230,7 @@ pub const Server = struct {
                 const req = QueryRequest.decode(payload[0..QueryRequest.SIZE]);
 
                 if (self.tsdb) |db| {
-                    var result = std.ArrayList(tsdb_mod.DataPoint){};
+                    var result = std.ArrayList(concurrent_tsdb_mod.DataPoint){};
                     defer result.deinit(self.allocator);
 
                     db.query(req.series_id, req.start_ts, req.end_ts, &result) catch |err| {
@@ -289,6 +297,27 @@ pub const Server = struct {
                     };
                 }
                 return self.proto.encodeOk();
+            },
+
+            .query_stats => {
+                var series_count: u32 = 0;
+                var total_points: u64 = 0;
+
+                if (self.tsdb) |db| {
+                    const stats = db.getStats();
+                    series_count = stats.series_count;
+                    total_points = stats.total_points + stats.buffered_points;
+                }
+
+                const now = std.time.timestamp();
+                const uptime: u64 = @intCast(@max(0, now - self.start_time));
+
+                return self.proto.encodeGlobalStatsResponse(.{
+                    .series_count = series_count,
+                    .total_points = total_points,
+                    .uptime_seconds = uptime,
+                    .connected_clients = @intCast(self.active_connections.load(.acquire)),
+                });
             },
 
             else => {
@@ -411,12 +440,14 @@ test "Server insert and query with TSDB" {
     const allocator = testing.allocator;
     const fs = std.fs;
 
-    // Create TSDB
-    var tsdb = try tsdb_mod.TSDB.init(allocator, .{
+    // Create ConcurrentTSDB
+    var tsdb = try ConcurrentTSDB.init(allocator, .{
         .wal_path = "/tmp/test_server_tsdb.wal",
     });
     defer tsdb.deinit();
     defer fs.cwd().deleteFile("/tmp/test_server_tsdb.wal") catch {};
+
+    try tsdb.start();
 
     // Create server with TSDB
     var srv = try Server.init(allocator, .{
@@ -453,6 +484,10 @@ test "Server insert and query with TSDB" {
     var resp_header = try Protocol.decodeHeader(&resp_buf);
     try testing.expectEqual(MessageType.ok, resp_header.msg_type);
 
+    // Wait for concurrent consumers to process and flush
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+    try tsdb.flush();
+
     // Send query
     const query_msg = try proto.encodeQuery(1, 0, 2000);
     _ = try posix.write(sock, query_msg);
@@ -479,12 +514,14 @@ test "Server batch insert" {
     const allocator = testing.allocator;
     const fs = std.fs;
 
-    // Create TSDB
-    var tsdb = try tsdb_mod.TSDB.init(allocator, .{
+    // Create ConcurrentTSDB
+    var tsdb = try ConcurrentTSDB.init(allocator, .{
         .wal_path = "/tmp/test_server_batch.wal",
     });
     defer tsdb.deinit();
     defer fs.cwd().deleteFile("/tmp/test_server_batch.wal") catch {};
+
+    try tsdb.start();
 
     // Create server with TSDB
     var srv = try Server.init(allocator, .{
@@ -525,6 +562,10 @@ test "Server batch insert" {
     var resp_header = try Protocol.decodeHeader(&resp_buf);
     try testing.expectEqual(MessageType.ok, resp_header.msg_type);
 
+    // Wait for concurrent consumers and flush
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+    try tsdb.flush();
+
     // Query to verify
     const query_msg = try proto.encodeQuery(1, 0, 5000);
     _ = try posix.write(sock, query_msg);
@@ -551,12 +592,14 @@ test "Server query latest" {
     const allocator = testing.allocator;
     const fs = std.fs;
 
-    // Create TSDB
-    var tsdb = try tsdb_mod.TSDB.init(allocator, .{
+    // Create ConcurrentTSDB
+    var tsdb = try ConcurrentTSDB.init(allocator, .{
         .wal_path = "/tmp/test_server_latest.wal",
     });
     defer tsdb.deinit();
     defer fs.cwd().deleteFile("/tmp/test_server_latest.wal") catch {};
+
+    try tsdb.start();
 
     // Create server with TSDB
     var srv = try Server.init(allocator, .{
@@ -592,6 +635,10 @@ test "Server query latest" {
 
     var resp_buf: [HEADER_SIZE]u8 = undefined;
     _ = try readExact(sock, &resp_buf);
+
+    // Wait for concurrent consumers and flush
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+    try tsdb.flush();
 
     // Query latest
     const latest_msg = try proto.encodeQueryLatest(1);

@@ -1,8 +1,11 @@
-.PHONY: build test clean run fmt check
+.PHONY: build test clean run serve web generate fmt check bench
 
 # Build the project
 build:
 	zig build
+
+# Build with web assets
+all: build web
 
 # Run all tests
 test:
@@ -14,11 +17,35 @@ test-verbose:
 
 # Clean build artifacts
 clean:
-	rm -rf .zig-cache zig-out
+	rm -rf .zig-cache zig-out tmp/*.wal
 
-# Run the server (requires --port argument)
+# Run the server
+serve:
+	@mkdir -p tmp
+	zig build && ./zig-out/bin/tsvdb serve --port 9876
+
+# Run the server with web UI
 run:
-	zig build run -- --port 9876
+	@mkdir -p tmp
+	zig build && zig build web && ./zig-out/bin/tsvdb serve --port 9876 --web-port 8080
+
+# Build web assets
+web:
+	zig build web
+
+# Generate test data (100 points)
+generate:
+	./zig-out/bin/tsvdb generate --port 9876 --series 1 --count 100
+
+# Generate more test data (1000 points)
+generate-large:
+	./zig-out/bin/tsvdb generate --port 9876 --series 1 --count 1000 --interval 100
+
+# Generate data for multiple series
+generate-multi:
+	./zig-out/bin/tsvdb generate --port 9876 --series 1 --count 100
+	./zig-out/bin/tsvdb generate --port 9876 --series 2 --count 100
+	./zig-out/bin/tsvdb generate --port 9876 --series 3 --count 100
 
 # Format source files
 fmt:
@@ -44,3 +71,7 @@ test-protocol:
 
 test-tsdb:
 	zig build test --summary all 2>&1 | grep -E "(tsdb|passed|failed)"
+
+# Run benchmarks
+bench:
+	zig build bench

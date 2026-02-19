@@ -19,15 +19,19 @@ High-frequency time series data optimizations.
   - Track `pending_writes` for proper completion handling
   - Result: 1 submit per flush (1000+ writes batched)
 
-- [ ] **Pre-allocate chunk pool**
+- [x] **Pre-allocate chunk pool**
   - Avoid allocations during hot ingestion path
   - Pool of ready-to-use chunks
   - Reset and reuse instead of alloc/free
+  - ChunkPool with acquire()/release() methods
+  - Configurable pool_size (default 16 chunks)
 
-- [ ] **Lock-free ingestion buffer**
+- [x] **Lock-free ingestion buffer**
   - Atomic ring buffer for concurrent writers
   - Multiple producer threads, single consumer
   - Avoid mutex contention on hot path
+  - LockFreeBuffer using Dmitry Vyukov's MPSC algorithm
+  - ConcurrentTSDB wrapper with background consumer thread
 
 ## Compression
 
@@ -48,18 +52,22 @@ High-frequency time series data optimizations.
 
 ## Storage Tiers
 
-- [ ] **Hot tier: in-memory chunks**
+- [x] **Hot tier: in-memory chunks**
   - Recent data, fast writes
   - Current active chunks
+  - Integrated with ChunkPool
 
-- [ ] **Warm tier: mmap'd chunks**
+- [x] **Warm tier: mmap'd chunks**
   - Completed chunks, memory-mapped
-  - Zero-copy queries
+  - Zero-copy queries via MmapChunk
   - OS manages page cache
+  - Binary search for time range queries
 
-- [ ] **Cold tier: compressed files**
-  - Old data, compressed on disk
+- [x] **Cold tier: compressed files**
+  - Old data in archive files
   - Load on demand for historical queries
+  - ColdStorage with archive management
+  - TieredStorage coordinates all three tiers
 
 ## Query Path
 
@@ -100,10 +108,13 @@ High-frequency time series data optimizations.
 
 ## Build & Test
 
-- [ ] **Benchmark suite**
+- [x] **Benchmark suite**
   - Ingestion throughput (points/sec)
   - Query latency
-  - Compression ratios
+  - Range query performance
+  - Concurrent ingestion
+  - Tiered storage performance
+  - Run with: `make bench` or `zig build bench`
 
 - [ ] **Fuzz testing**
   - Protocol fuzzing
@@ -113,7 +124,9 @@ High-frequency time series data optimizations.
 
 1. ~~Buffer writes in memory~~ (DONE)
 2. ~~Batch io_uring submissions~~ (DONE)
-3. Delta encoding for timestamps
-4. Gorilla compression for values
-5. Pre-allocate chunk pool
-6. Timestamp index for queries
+3. ~~Pre-allocate chunk pool~~ (DONE)
+4. ~~Lock-free ingestion buffer~~ (DONE)
+5. ~~Storage tiers (hot/warm/cold)~~ (DONE)
+6. Delta encoding for timestamps
+7. Gorilla compression for values
+8. Timestamp index for queries
