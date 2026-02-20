@@ -4,8 +4,7 @@ const testing = std.testing;
 const server = @import("server/server.zig");
 const http = @import("web/http.zig");
 const client_mod = @import("client/client.zig");
-const concurrent_tsdb_mod = @import("timeserie/concurrent_tsdb.zig");
-const ConcurrentTSDB = concurrent_tsdb_mod.ConcurrentTSDB;
+const TSDB = @import("timeserie/tsdb.zig").TSDB;
 
 // Global configuration populated by CLI argument parsing
 var config = struct {
@@ -105,7 +104,7 @@ pub fn main() !void {
 
 // Global state for stats and query callbacks
 var global_server: ?*server.Server = null;
-var global_tsdb: ?*ConcurrentTSDB = null;
+var global_tsdb: ?*TSDB = null;
 var start_time: i64 = 0;
 
 // TCP client config for HTTP server to use
@@ -210,8 +209,8 @@ fn run_server() !void {
     const allocator = std.heap.page_allocator;
     start_time = std.time.timestamp();
 
-    // Initialize ConcurrentTSDB
-    var tsdb = try ConcurrentTSDB.init(allocator, .{
+    // Initialize TSDB
+    var tsdb = try TSDB.init(allocator, .{
         .wal_path = "tmp/data.wal",
     });
     defer tsdb.deinit();

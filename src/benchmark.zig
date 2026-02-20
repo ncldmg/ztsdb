@@ -7,10 +7,9 @@ const Thread = std.Thread;
 const Allocator = std.mem.Allocator;
 
 const Server = @import("server/server.zig").Server;
-const client_mod = @import("client/client.zig");
-const Client = client_mod.Client;
-const BufferedClient = client_mod.BufferedClient;
-const ConcurrentTSDB = @import("timeserie/concurrent_tsdb.zig").ConcurrentTSDB;
+const Client = @import("client/client.zig").Client;
+const BufferedClient = @import("client/client.zig").BufferedClient;
+const TSDB = @import("timeserie/tsdb.zig").TSDB;
 const protocol = @import("protocol/protocol.zig");
 const DataPoint = protocol.DataPoint;
 
@@ -93,17 +92,15 @@ fn benchmarkStorage(allocator: Allocator, mode: StorageMode) !void {
     }
 
     var tsdb = switch (mode) {
-        .hot_only => try ConcurrentTSDB.init(allocator, .{
+        .hot_only => try TSDB.init(allocator, .{
             .wal_path = wal_path,
             .chunk_capacity = 10_000_000,
-            .write_buffer_capacity = 100_000,
-            .ingestion_buffer_capacity = 1_000_000, // Large buffer for high throughput
+            .ingestion_buffer_capacity = 1_000_000,
             .num_partitions = 8,
         }),
-        .with_warm => try ConcurrentTSDB.init(allocator, .{
+        .with_warm => try TSDB.init(allocator, .{
             .wal_path = wal_path,
             .chunk_capacity = 500_000,
-            .write_buffer_capacity = 50_000,
             .enable_tiered_storage = true,
             .data_dir = data_dir,
             .wal_segment_size = 256 * 1024 * 1024,
@@ -111,15 +108,14 @@ fn benchmarkStorage(allocator: Allocator, mode: StorageMode) !void {
             .ingestion_buffer_capacity = 1_000_000,
             .num_partitions = 8,
         }),
-        .with_cold => try ConcurrentTSDB.init(allocator, .{
+        .with_cold => try TSDB.init(allocator, .{
             .wal_path = wal_path,
-            .chunk_capacity = 500_000, // Larger chunks = fewer compactions
-            .write_buffer_capacity = 100_000,
+            .chunk_capacity = 500_000,
             .enable_tiered_storage = true,
             .data_dir = data_dir,
             .wal_segment_size = 256 * 1024 * 1024,
-            .max_warm_chunks = 50, // More warm chunks before cold compaction
-            .ingestion_buffer_capacity = 4_000_000, // Larger buffer for compaction overhead
+            .max_warm_chunks = 50,
+            .ingestion_buffer_capacity = 4_000_000,
             .num_partitions = 8,
         }),
     };

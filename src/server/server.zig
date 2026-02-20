@@ -5,8 +5,8 @@ const posix = std.posix;
 const Allocator = std.mem.Allocator;
 
 const protocol = @import("../protocol/protocol.zig");
-const concurrent_tsdb_mod = @import("../timeserie/concurrent_tsdb.zig");
-const ConcurrentTSDB = concurrent_tsdb_mod.ConcurrentTSDB;
+const tsdb_mod = @import("../timeserie/tsdb.zig");
+const TSDB = tsdb_mod.TSDB;
 
 const Header = protocol.Header;
 const MessageType = protocol.MessageType;
@@ -22,7 +22,7 @@ pub const Server = struct {
     allocator: Allocator,
     address: net.Address,
     listener: ?posix.socket_t,
-    tsdb: ?*ConcurrentTSDB,
+    tsdb: ?*TSDB,
     running: std.atomic.Value(bool),
     active_connections: std.atomic.Value(usize),
     proto: Protocol,
@@ -31,7 +31,7 @@ pub const Server = struct {
     pub const Config = struct {
         host: []const u8 = "127.0.0.1",
         port: u16 = 9876,
-        tsdb: ?*ConcurrentTSDB = null,
+        tsdb: ?*TSDB = null,
     };
 
     pub fn init(allocator: Allocator, config: Config) !Server {
@@ -203,8 +203,8 @@ pub const Server = struct {
                 defer self.allocator.free(points);
 
                 if (self.tsdb) |db| {
-                    // Convert to ConcurrentTSDB DataPoint format
-                    const tsdb_points = try self.allocator.alloc(concurrent_tsdb_mod.DataPoint, points.len);
+                    // Convert to TSDB DataPoint format
+                    const tsdb_points = try self.allocator.alloc(tsdb_mod.DataPoint, points.len);
                     defer self.allocator.free(tsdb_points);
 
                     for (points, 0..) |p, i| {
@@ -230,7 +230,7 @@ pub const Server = struct {
                 const req = QueryRequest.decode(payload[0..QueryRequest.SIZE]);
 
                 if (self.tsdb) |db| {
-                    var result = std.ArrayList(concurrent_tsdb_mod.DataPoint){};
+                    var result = std.ArrayList(tsdb_mod.DataPoint){};
                     defer result.deinit(self.allocator);
 
                     db.query(req.series_id, req.start_ts, req.end_ts, &result) catch |err| {
@@ -440,8 +440,8 @@ test "Server insert and query with TSDB" {
     const allocator = testing.allocator;
     const fs = std.fs;
 
-    // Create ConcurrentTSDB
-    var tsdb = try ConcurrentTSDB.init(allocator, .{
+    // Create TSDB
+    var tsdb = try TSDB.init(allocator, .{
         .wal_path = "/tmp/test_server_tsdb.wal",
     });
     defer tsdb.deinit();
@@ -514,8 +514,8 @@ test "Server batch insert" {
     const allocator = testing.allocator;
     const fs = std.fs;
 
-    // Create ConcurrentTSDB
-    var tsdb = try ConcurrentTSDB.init(allocator, .{
+    // Create TSDB
+    var tsdb = try TSDB.init(allocator, .{
         .wal_path = "/tmp/test_server_batch.wal",
     });
     defer tsdb.deinit();
@@ -592,8 +592,8 @@ test "Server query latest" {
     const allocator = testing.allocator;
     const fs = std.fs;
 
-    // Create ConcurrentTSDB
-    var tsdb = try ConcurrentTSDB.init(allocator, .{
+    // Create TSDB
+    var tsdb = try TSDB.init(allocator, .{
         .wal_path = "/tmp/test_server_latest.wal",
     });
     defer tsdb.deinit();
