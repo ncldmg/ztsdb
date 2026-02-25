@@ -1,10 +1,27 @@
 const std = @import("std");
 
-fn buildModule(b: *std.Build, target: std.Build.ResolvedTarget) *std.Build.Module {
+fn buildModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Module {
+    // Add protobuf dependency
+    const protobuf_dep = b.dependency("protobuf", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
     const mod = b.addModule("tsvdb", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
+        .imports = &.{
+            .{ .name = "protobuf", .module = protobuf_dep.module("protobuf") },
+        },
     });
+
+    // Link libbpf for eBPF support
+    mod.link_libc = true;
+
     return mod;
 }
 
@@ -37,6 +54,13 @@ fn buildExecutable(
             },
         }),
     });
+
+    // Link libbpf and dependencies for eBPF collector
+    exe.linkLibC();
+    exe.linkSystemLibrary("bpf");
+    exe.linkSystemLibrary("elf");
+    exe.linkSystemLibrary("z");
+
     return exe;
 }
 
@@ -44,7 +68,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const mod = buildModule(b, target);
+    const mod = buildModule(b, target, optimize);
     const mod_tests = buildModuleTest(b, mod);
     const exe = buildExecutable(b, target, optimize, mod);
 
@@ -77,12 +101,6 @@ pub fn build(b: *std.Build) void {
     const lib_test_step = b.step("lib-test", "Build library test binary");
     b.installArtifact(mod_tests);
     lib_test_step.dependOn(&b.addInstallArtifact(mod_tests, .{}).step);
-
-    // Copy web assets to zig-out/web
-    const install_html = b.addInstallFile(b.path("src/web/index.html"), "web/index.html");
-
-    const web_step = b.step("web", "Copy web UI assets");
-    web_step.dependOn(&install_html.step);
 
     // Benchmark executable
     const bench_exe = b.addExecutable(.{

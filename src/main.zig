@@ -5,6 +5,8 @@ const server = @import("server/server.zig");
 const http = @import("web/http.zig");
 const client_mod = @import("client/client.zig");
 const TSDB = @import("timeserie/tsdb.zig").TSDB;
+const collector_mod = @import("collector/collector.zig");
+const Registry = @import("metrics/registry.zig").Registry;
 
 // Global configuration populated by CLI argument parsing
 var config = struct {
@@ -20,6 +22,17 @@ var gen_config = struct {
     series_id: u64 = 1,
     count: u32 = 100,
     interval_ms: u64 = 1000,
+}{};
+
+// Collect command config
+var collect_config = struct {
+    port: u16 = 9876,
+    web_port: ?u16 = null,
+    cgroup_root: []const u8 = "/sys/fs/cgroup",
+    bpf_object: ?[]const u8 = null,
+    interval_ms: u64 = 1000,
+    discovery_interval_ms: u64 = 5000,
+    debug: bool = false,
 }{};
 
 // Entry point: sets up CLI parsing and launches the server
@@ -95,6 +108,53 @@ pub fn main() !void {
                             .action = cli.CommandAction{ .exec = run_generate },
                         },
                     },
+                    .{
+                        .name = "collect",
+                        .options = try r.allocOptions(&.{
+                            .{
+                                .long_name = "port",
+                                .short_alias = 'p',
+                                .help = "TSDB port for internal storage",
+                                .value_ref = r.mkRef(&collect_config.port),
+                            },
+                            .{
+                                .long_name = "web-port",
+                                .short_alias = 'w',
+                                .help = "HTTP port for stats/queries",
+                                .value_ref = r.mkRef(&collect_config.web_port),
+                            },
+                            .{
+                                .long_name = "cgroup-root",
+                                .help = "cgroup v2 root path",
+                                .value_ref = r.mkRef(&collect_config.cgroup_root),
+                            },
+                            .{
+                                .long_name = "bpf-object",
+                                .help = "path to BPF object file (uses embedded if not set)",
+                                .value_ref = r.mkRef(&collect_config.bpf_object),
+                            },
+                            .{
+                                .long_name = "interval",
+                                .short_alias = 'i',
+                                .help = "collection interval in ms",
+                                .value_ref = r.mkRef(&collect_config.interval_ms),
+                            },
+                            .{
+                                .long_name = "discovery-interval",
+                                .help = "container discovery interval in ms",
+                                .value_ref = r.mkRef(&collect_config.discovery_interval_ms),
+                            },
+                            .{
+                                .long_name = "debug",
+                                .short_alias = 'd',
+                                .help = "enable debug logging",
+                                .value_ref = r.mkRef(&collect_config.debug),
+                            },
+                        }),
+                        .target = cli.CommandTarget{
+                            .action = cli.CommandAction{ .exec = run_collect },
+                        },
+                    },
                 }),
             },
         },
@@ -105,11 +165,19 @@ pub fn main() !void {
 // Global state for stats and query callbacks
 var global_server: ?*server.Server = null;
 var global_tsdb: ?*TSDB = null;
+var global_registry: ?*Registry = null;
 var start_time: i64 = 0;
 
 // TCP client config for HTTP server to use
 var tcp_host: []const u8 = "127.0.0.1";
 var tcp_port: u16 = 9876;
+
+fn getSeries(allocator: std.mem.Allocator) ?[]u8 {
+    if (global_registry) |reg| {
+        return reg.toJson(allocator) catch null;
+    }
+    return null;
+}
 
 fn getStats() http.HttpServer.Stats {
     const allocator = std.heap.page_allocator;
@@ -237,14 +305,15 @@ fn run_server() !void {
     // Start listening
     try srv.start();
 
-    // Start HTTP server for web UI if requested
+    // Start HTTP server if requested
     var http_server: ?http.HttpServer = null;
     if (config.web_port) |web_port| {
-        http_server = try http.HttpServer.init(allocator, web_port, "zig-out/web");
+        http_server = try http.HttpServer.init(allocator, web_port, null);
         http_server.?.setStatsCallback(&getStats);
         http_server.?.setQueryCallback(&queryData);
+        http_server.?.setSeriesCallback(&getSeries);
         try http_server.?.start();
-        std.log.info("web UI available at http://127.0.0.1:{d}/", .{http_server.?.port});
+        std.log.info("HTTP API available at http://127.0.0.1:{d}/", .{http_server.?.port});
     }
     defer if (http_server) |*h| h.deinit();
 
@@ -302,6 +371,108 @@ fn run_server() !void {
     // Stop server and wait for thread to finish
     srv.stop();
     server_thread.join();
+}
+
+/// Run the eBPF container metrics collector
+fn run_collect() !void {
+    const allocator = std.heap.page_allocator;
+    start_time = std.time.timestamp();
+
+    std.log.info("Starting eBPF container metrics collector...", .{});
+
+    // Initialize TSDB
+    var tsdb = try TSDB.init(allocator, .{
+        .wal_path = "tmp/collector.wal",
+    });
+    defer tsdb.deinit();
+    global_tsdb = &tsdb;
+    defer {
+        global_tsdb = null;
+    }
+
+    // Start concurrent consumers
+    try tsdb.start();
+
+    // Initialize shared metrics registry
+    var registry = Registry.init(allocator);
+    defer registry.deinit();
+    global_registry = &registry;
+    defer {
+        global_registry = null;
+    }
+
+    // Initialize collector with shared registry
+    var coll = try collector_mod.Collector.init(allocator, &tsdb, &registry, .{
+        .bpf_object_path = collect_config.bpf_object,
+        .cgroup_root = collect_config.cgroup_root,
+        .collection_interval_ms = collect_config.interval_ms,
+        .discovery_interval_ms = collect_config.discovery_interval_ms,
+        .debug = collect_config.debug,
+    });
+    defer coll.deinit();
+
+    // Load BPF programs
+    try coll.load();
+    std.log.info("eBPF programs loaded successfully", .{});
+
+    // Start collecting
+    try coll.start();
+
+    // Start HTTP server for stats/queries if requested
+    var http_server: ?http.HttpServer = null;
+    if (collect_config.web_port) |web_port| {
+        http_server = try http.HttpServer.init(allocator, web_port, null);
+        http_server.?.setStatsCallback(&getStats);
+        http_server.?.setSeriesCallback(&getSeries);
+        try http_server.?.start();
+        std.log.info("HTTP endpoint available at http://0.0.0.0:{d}", .{web_port});
+    }
+    defer if (http_server) |*h| h.deinit();
+
+    // Run collector loop in a separate thread
+    const collector_thread = try std.Thread.spawn(.{}, struct {
+        fn run(c: *collector_mod.Collector) void {
+            collector_mod.runCollectorLoop(c);
+        }
+    }.run, .{&coll});
+
+    // Block SIGINT and SIGTERM for graceful shutdown
+    var sigset = std.posix.sigemptyset();
+    std.posix.sigaddset(&sigset, std.posix.SIG.INT);
+    std.posix.sigaddset(&sigset, std.posix.SIG.TERM);
+    std.posix.sigprocmask(std.posix.SIG.BLOCK, &sigset, null);
+
+    const sigfd = try std.posix.signalfd(-1, &sigset, 0);
+    defer std.posix.close(sigfd);
+
+    var fds = [_]std.posix.pollfd{
+        .{ .fd = sigfd, .events = std.posix.POLL.IN, .revents = 0 },
+        .{ .fd = shutdown_fd orelse -1, .events = std.posix.POLL.IN, .revents = 0 },
+    };
+    const nfds: usize = if (shutdown_fd != null) 2 else 1;
+
+    _ = try std.posix.poll(fds[0..nfds], -1);
+
+    if (fds[0].revents & std.posix.POLL.IN != 0) {
+        var info: std.os.linux.signalfd_siginfo = undefined;
+        _ = try std.posix.read(sigfd, std.mem.asBytes(&info));
+        std.log.info("received signal {d}, shutting down", .{info.signo});
+    } else {
+        std.log.info("shutdown requested", .{});
+    }
+
+    // Stop collector and wait for thread
+    coll.stop();
+    collector_thread.join();
+
+    // Print final stats
+    const stats = coll.getStats();
+    std.log.info("Collector stopped. Stats: collections={d}, points={d}, errors={d}, containers={d}", .{
+        stats.collections,
+        stats.points_inserted,
+        stats.errors,
+        stats.containers,
+    });
 }
 
 // Test graceful shutdown using a pipe to simulate shutdown signal

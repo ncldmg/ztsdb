@@ -1,8 +1,16 @@
-.PHONY: build test clean run serve web generate fmt check bench
+.PHONY: build test clean run serve web generate fmt check bench bpf
 
 # Build the project
 build:
 	zig build
+
+# Build BPF programs (requires clang and libbpf-dev)
+bpf:
+	$(MAKE) -C src/bpf all
+
+# Build BPF for both architectures
+bpf-all:
+	$(MAKE) -C src/bpf both
 
 # Build with web assets
 all: build web

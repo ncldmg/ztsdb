@@ -11,7 +11,8 @@ pub const HttpServer = struct {
     running: std.atomic.Value(bool),
     stats_fn: ?*const fn () Stats,
     query_fn: ?*const fn (std.mem.Allocator, u64, i64, i64) QueryResult,
-    web_root: []const u8,
+    series_fn: ?*const fn (std.mem.Allocator) ?[]u8,
+    web_root: ?[]const u8,
 
     pub const Stats = struct {
         series_count: u32 = 0,
@@ -32,7 +33,7 @@ pub const HttpServer = struct {
         }
     };
 
-    pub fn init(allocator: std.mem.Allocator, port: u16, web_root: []const u8) !HttpServer {
+    pub fn init(allocator: std.mem.Allocator, port: u16, web_root: ?[]const u8) !HttpServer {
         const socket = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
         errdefer posix.close(socket);
 
@@ -61,6 +62,7 @@ pub const HttpServer = struct {
             .running = std.atomic.Value(bool).init(false),
             .stats_fn = null,
             .query_fn = null,
+            .series_fn = null,
             .web_root = web_root,
         };
     }
@@ -76,6 +78,10 @@ pub const HttpServer = struct {
 
     pub fn setQueryCallback(self: *HttpServer, callback: *const fn (std.mem.Allocator, u64, i64, i64) QueryResult) void {
         self.query_fn = callback;
+    }
+
+    pub fn setSeriesCallback(self: *HttpServer, callback: *const fn (std.mem.Allocator) ?[]u8) void {
+        self.series_fn = callback;
     }
 
     pub fn start(self: *HttpServer) !void {
@@ -134,10 +140,12 @@ pub const HttpServer = struct {
         }
 
         // Route handling
-        if (std.mem.eql(u8, path, "/api/stats")) {
+        if (std.mem.eql(u8, path, "/api/stats") or std.mem.eql(u8, path, "/stats")) {
             try self.handleStats(client);
-        } else if (std.mem.startsWith(u8, path, "/api/query")) {
+        } else if (std.mem.startsWith(u8, path, "/api/query") or std.mem.startsWith(u8, path, "/query")) {
             try self.handleQuery(client, path);
+        } else if (std.mem.eql(u8, path, "/series") or std.mem.eql(u8, path, "/api/series")) {
+            try self.handleSeries(client);
         } else {
             try self.handleStatic(client, path);
         }
@@ -226,7 +234,30 @@ pub const HttpServer = struct {
         }
     }
 
+    fn handleSeries(self: *HttpServer, client: posix.socket_t) !void {
+        if (self.series_fn) |get_series| {
+            if (get_series(self.allocator)) |json| {
+                defer self.allocator.free(json);
+                try sendResponse(client, "200 OK", "application/json", json);
+            } else {
+                try sendResponse(client, "200 OK", "application/json", "[]");
+            }
+        } else {
+            try sendResponse(client, "200 OK", "application/json", "[]");
+        }
+    }
+
     fn handleStatic(self: *HttpServer, client: posix.socket_t, path: []const u8) !void {
+        // If no web root, just return a simple API info
+        const web_root = self.web_root orelse {
+            if (std.mem.eql(u8, path, "/") or std.mem.eql(u8, path, "/index.html")) {
+                try sendResponse(client, "200 OK", "text/plain", "ztsdb HTTP API\n\nEndpoints:\n  GET /stats   - Server statistics\n  GET /series  - List all series\n  GET /query?series=ID&start=TS&end=TS - Query data\n");
+            } else {
+                try sendResponse(client, "404 Not Found", "text/plain", "Not Found");
+            }
+            return;
+        };
+
         // Normalize path
         var file_path = if (std.mem.eql(u8, path, "/")) "/index.html" else path;
 
@@ -246,7 +277,7 @@ pub const HttpServer = struct {
 
         // Build full path
         var full_path_buf: [512]u8 = undefined;
-        const full_path = std.fmt.bufPrint(&full_path_buf, "{s}{s}", .{ self.web_root, file_path }) catch {
+        const full_path = std.fmt.bufPrint(&full_path_buf, "{s}{s}", .{ web_root, file_path }) catch {
             try sendResponse(client, "500 Internal Server Error", "text/plain", "Path too long");
             return;
         };

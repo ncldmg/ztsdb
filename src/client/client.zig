@@ -82,7 +82,7 @@ pub const Client = struct {
         return self.sock != null;
     }
 
-    /// Insert a single data point
+    // Insert a single data point
     pub fn insert(self: *Client, series_id: u64, timestamp: i64, value: f64) !void {
         const msg = try self.proto.encodeInsert(.{
             .series_id = series_id,
@@ -93,19 +93,19 @@ pub const Client = struct {
         try self.sendAndExpectOk(msg);
     }
 
-    /// Insert multiple data points in batch
+    // Insert multiple data points in batch
     pub fn insertBatch(self: *Client, points: []const DataPoint) !void {
         const msg = try self.proto.encodeInsertBatch(points);
         try self.sendAndExpectOk(msg);
     }
 
-    /// Query data points for a series within a time range
+    // Query data points for a series within a time range
     pub fn query(self: *Client, series_id: u64, start_ts: i64, end_ts: i64) ![]DataPoint {
         const msg = try self.proto.encodeQuery(series_id, start_ts, end_ts);
         return self.sendAndReceiveData(msg);
     }
 
-    /// Query the latest value for a series
+    // Query the latest value for a series
     pub fn queryLatest(self: *Client, series_id: u64) !?DataPoint {
         const msg = try self.proto.encodeQueryLatest(series_id);
 
@@ -143,7 +143,7 @@ pub const Client = struct {
         }
     }
 
-    /// Ping the server
+    // Ping the server
     pub fn ping(self: *Client) !void {
         var msg: [HEADER_SIZE]u8 = undefined;
         const header = Header{
@@ -157,7 +157,7 @@ pub const Client = struct {
         try self.sendAndExpectOk(&msg);
     }
 
-    /// Request server to flush WAL
+    // Request server to flush WAL
     pub fn flush(self: *Client) !void {
         var msg: [HEADER_SIZE]u8 = undefined;
         const header = Header{
@@ -171,7 +171,7 @@ pub const Client = struct {
         try self.sendAndExpectOk(&msg);
     }
 
-    /// Request server to sync WAL to disk
+    // Request server to sync WAL to disk
     pub fn sync(self: *Client) !void {
         var msg: [HEADER_SIZE]u8 = undefined;
         const header = Header{
@@ -185,7 +185,7 @@ pub const Client = struct {
         try self.sendAndExpectOk(&msg);
     }
 
-    /// Get global database stats
+    // Get global database stats
     pub fn getGlobalStats(self: *Client) !GlobalStatsResponse {
         var msg: [HEADER_SIZE]u8 = undefined;
         const header = Header{

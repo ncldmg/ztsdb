@@ -1,5 +1,6 @@
 const std = @import("std");
 
+// Core TSDB modules
 pub const chunk = @import("timeserie/chunk.zig");
 pub const wal = @import("timeserie/wal.zig");
 pub const tsdb = @import("timeserie/tsdb.zig");
@@ -12,6 +13,23 @@ pub const server = @import("server/server.zig");
 pub const client = @import("client/client.zig");
 pub const http = @import("web/http.zig");
 
+// eBPF integration modules
+pub const ebpf = struct {
+    pub const libbpf = @import("ebpf/libbpf.zig");
+};
+
+pub const cgroup = struct {
+    pub const container = @import("cgroup/container.zig");
+    pub const detector = @import("cgroup/detector.zig");
+};
+
+pub const collector = struct {
+    pub const main = @import("collector/collector.zig");
+    pub const series = @import("collector/series.zig");
+    pub const metrics = @import("collector/metrics.zig");
+};
+
+// Re-exported types for convenience
 pub const Chunk = chunk.Chunk;
 pub const ChunkPool = chunk.ChunkPool;
 pub const WAL = wal.WAL;
@@ -25,6 +43,12 @@ pub const DataPoint = protocol.DataPoint;
 pub const Server = server.Server;
 pub const Client = client.Client;
 pub const HttpServer = http.HttpServer;
+
+// eBPF types
+pub const Collector = collector.main.Collector;
+pub const CgroupMetrics = collector.main.CgroupMetrics;
+pub const Container = cgroup.container.Container;
+pub const ContainerRuntime = cgroup.container.ContainerRuntime;
 
 // Import tests
 test {
@@ -40,4 +64,11 @@ test {
     _ = server;
     _ = client;
     _ = http;
+    // eBPF modules
+    _ = ebpf.libbpf;
+    _ = cgroup.container;
+    _ = cgroup.detector;
+    _ = collector.main;
+    _ = collector.series;
+    _ = collector.metrics;
 }
